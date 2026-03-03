@@ -1,0 +1,154 @@
+services:
+
+  # ── RabbitMQ ──────────────────────────────────────────────────────────────
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    container_name: rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - platform-network
+
+  # ── Task Service ──────────────────────────────────────────────────────────
+  task-service:
+    build: ./task-service
+    container_name: task_service
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql://user:password@task-db:5432/taskdb
+      REDIS_URL: redis://task-redis:6379/0
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+    depends_on:
+      task-db:
+        condition: service_healthy
+      task-redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - platform-network
+    restart: unless-stopped
+
+  task-consumer:
+    build:
+      context: ./task-service
+      dockerfile: Dockerfile.consumer
+    container_name: task_consumer
+    environment:
+      DATABASE_URL: postgresql://user:password@task-db:5432/taskdb
+      REDIS_URL: redis://task-redis:6379/0
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+    depends_on:
+      task-db:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - platform-network
+    restart: unless-stopped
+
+  task-db:
+    image: postgres:16-alpine
+    container_name: task_db
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: taskdb
+    volumes:
+      - task_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d taskdb"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - platform-network
+
+  task-redis:
+    image: redis:7-alpine
+    container_name: task_redis
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - task_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - platform-network
+
+  # ── User Service ──────────────────────────────────────────────────────────
+  user-service:
+    build: ./user-service
+    container_name: user_service
+    ports:
+      - "8001:8001"
+    environment:
+      DATABASE_URL: postgresql://user:password@user-db:5432/userdb
+      REDIS_URL: redis://user-redis:6379/0
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+    depends_on:
+      user-db:
+        condition: service_healthy
+      user-redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - platform-network
+    restart: unless-stopped
+
+  user-db:
+    image: postgres:16-alpine
+    container_name: user_db
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: userdb
+    volumes:
+      - user_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d userdb"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - platform-network
+
+  user-redis:
+    image: redis:7-alpine
+    container_name: user_redis
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - user_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - platform-network
+
+volumes:
+  task_postgres_data:
+  task_redis_data:
+  user_postgres_data:
+  user_redis_data:
+  rabbitmq_data:
+
+networks:
+  platform-network:
+    driver: bridge
