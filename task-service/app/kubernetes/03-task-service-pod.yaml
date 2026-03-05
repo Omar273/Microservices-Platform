@@ -88,11 +88,11 @@ spec:
         - containerPort: 8000
       env:
         - name: DATABASE_URL
-          value: "postgresql://myuser:mypassword@localhost:5432/taskdb"
+          value: secrets.DB_URL
         - name: REDIS_URL
-          value: "redis://localhost:6379/0"
+          value: secrets.REDIS_URL
         - name: RABBITMQ_URL
-          value: "amqp://guest:guest@rabbitmq-svc:5672/"
+          value: secrets.RABBITMQ_URL
       readinessProbe:
         httpGet:
           path: /health
@@ -120,11 +120,11 @@ spec:
       imagePullPolicy: Never
       env:
         - name: DATABASE_URL
-          value: "postgresql://user:password@localhost:5432/taskdb"
+          value: secrets.DB_URL
         - name: REDIS_URL
-          value: "redis://localhost:6379/0"
+          value: secrets.REDIS_URL
         - name: RABBITMQ_URL
-          value: "amqp://guest:guest@rabbitmq-svc:5672/"
+          value: secrets.RABBITMQ_URL
       resources:
         requests:
           memory: "64Mi"
@@ -182,7 +182,7 @@ spec:
         - containerPort: 9187
       env:
         - name: DATA_SOURCE_NAME
-          value: "postgresql://myuser:mypassword@localhost:5432/taskdb?sslmode=disable"
+          value: secrets.DATA_SOURCE_URL
       resources:
         requests:
           memory: "32Mi"
@@ -200,7 +200,7 @@ spec:
         - containerPort: 9121
       env:
         - name: REDIS_ADDR
-          value: "redis://localhost:6379"
+          value: secrets.REDIS_URL
       resources:
         requests:
           memory: "32Mi"
