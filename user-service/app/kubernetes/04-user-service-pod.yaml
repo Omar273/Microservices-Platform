@@ -1,0 +1,219 @@
+# =============================================================================
+#  USER-SERVICE POD
+#
+#  This single pod contains 4 containers:
+#  1. user-service   → FastAPI app  (port 8001)
+#  2. user-db        → PostgreSQL   (port 5432)
+#  3. user-redis     → Redis cache  (port 6379)
+#  4. user-consumer  → RabbitMQ worker (no port, background process)
+#
+#  All 4 containers share the same localhost network inside this pod.
+#  user-service connects to its DB via localhost:5432
+#  user-service connects to its Redis via localhost:6379
+# =============================================================================
+
+apiVersion: v1
+kind: Pod
+metadata:
+  name: user-service-pod
+  namespace: task-manager
+  labels:
+    app: user-service
+spec:
+
+  # ── Init container: wait for DB to be ready before starting FastAPI ─────────
+  initContainers:
+    - name: wait-for-db
+      image: postgres:16-alpine
+      command:
+        - sh
+        - -c
+        - |
+          until pg_isready -h localhost -U user -d userdb; do
+            echo "Waiting for user-db..."
+            sleep 2
+          done
+          echo "user-db is ready!"
+
+  containers:
+
+    # ── 1. PostgreSQL ──────────────────────────────────────────────────────────
+    - name: user-db
+      image: postgres:16-alpine
+      ports:
+        - containerPort: 5432
+      env:
+        - name: POSTGRES_USER
+          valueFrom:
+            secretKeyRef:
+              name: platform-secrets
+              key: POSTGRES_USER
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: platform-secrets
+              key: POSTGRES_PASSWORD
+        - name: POSTGRES_DB
+          value: "userdb"
+        - name: PGDATA
+          value: /var/lib/postgresql/data/pgdata
+      volumeMounts:
+        - name: user-db-storage
+          mountPath: /var/lib/postgresql/data
+      resources:
+        requests:
+          memory: "128Mi"
+          cpu: "100m"
+        limits:
+          memory: "256Mi"
+          cpu: "250m"
+
+    # ── 2. Redis ───────────────────────────────────────────────────────────────
+    - name: user-redis
+      image: redis:7-alpine
+      command:
+        - redis-server
+        - "--appendonly"
+        - "yes"
+        - "--maxmemory"
+        - "128mb"
+        - "--maxmemory-policy"
+        - "allkeys-lru"
+      ports:
+        - containerPort: 6379
+      volumeMounts:
+        - name: user-redis-storage
+          mountPath: /data
+      resources:
+        requests:
+          memory: "64Mi"
+          cpu: "50m"
+        limits:
+          memory: "128Mi"
+          cpu: "100m"
+
+    # ── 3. FastAPI (user-service) ──────────────────────────────────────────────
+    - name: user-service
+      image: user-service:latest
+      imagePullPolicy: Never        # use locally built image
+      ports:
+        - containerPort: 8001
+      env:
+        # localhost because DB is in the same pod
+        - name: DATABASE_URL
+          value: "postgresql://user:password@localhost:5432/userdb"
+        # localhost because Redis is in the same pod
+        - name: REDIS_URL
+          value: "redis://localhost:6379/0"
+        # rabbitmq-svc because RabbitMQ is in its own pod
+        - name: RABBITMQ_URL
+          value: "amqp://guest:guest@rabbitmq-svc:5672/"
+      readinessProbe:
+        httpGet:
+          path: /health
+          port: 8001
+        initialDelaySeconds: 15
+        periodSeconds: 5
+        failureThreshold: 5
+      livenessProbe:
+        httpGet:
+          path: /health
+          port: 8001
+        initialDelaySeconds: 30
+        periodSeconds: 10
+      resources:
+        requests:
+          memory: "128Mi"
+          cpu: "100m"
+        limits:
+          memory: "256Mi"
+          cpu: "300m"
+
+    # ── 4. User Consumer (RabbitMQ worker) ─────────────────────────────────────
+    - name: user-consumer
+      image: user-consumer:latest
+      imagePullPolicy: Never
+      env:
+        - name: DATABASE_URL
+          value: "postgresql://user:password@localhost:5432/userdb"
+        - name: REDIS_URL
+          value: "redis://localhost:6379/0"
+        - name: RABBITMQ_URL
+          value: "amqp://guest:guest@rabbitmq-svc:5672/"
+      resources:
+        requests:
+          memory: "64Mi"
+          cpu: "50m"
+        limits:
+          memory: "128Mi"
+          cpu: "150m"
+
+  # ── Volumes ──────────────────────────────────────────────────────────────────
+  volumes:
+    - name: user-db-storage
+      persistentVolumeClaim:
+        claimName: user-db-pvc
+    - name: user-redis-storage
+      persistentVolumeClaim:
+        claimName: user-redis-pvc
+
+  restartPolicy: Always
+
+---
+# PVC for PostgreSQL data
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: user-db-pvc
+  namespace: task-manager
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+
+---
+# PVC for Redis data
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: user-redis-pvc
+  namespace: task-manager
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 512Mi
+
+---
+# ClusterIP — task-service pod can reach user-service internally
+apiVersion: v1
+kind: Service
+metadata:
+  name: user-service-svc
+  namespace: task-manager
+spec:
+  selector:
+    app: user-service
+  ports:
+    - port: 8001
+      targetPort: 8001
+  type: ClusterIP
+
+---
+# NodePort — open http://localhost:30801/docs in your browser
+apiVersion: v1
+kind: Service
+metadata:
+  name: user-service-nodeport
+  namespace: task-manager
+spec:
+  selector:
+    app: user-service
+  ports:
+    - port: 8001
+      targetPort: 8001
+      nodePort: 30801
+  type: NodePort

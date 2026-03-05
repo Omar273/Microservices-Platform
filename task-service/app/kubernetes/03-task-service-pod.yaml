@@ -1,0 +1,362 @@
+# =============================================================================
+#  TASK-SERVICE POD
+#
+#  This single pod contains 5 containers:
+#  1. task-service   → FastAPI app  (port 8000)
+#  2. task-db        → PostgreSQL   (port 5432)
+#  3. task-redis     → Redis cache  (port 6379)
+#  4. task-consumer  → RabbitMQ worker (no port, background process)
+#  5. prometheus     → Metrics scraper (port 9090)  ← NEW
+# =============================================================================
+
+apiVersion: v1
+kind: Pod
+metadata:
+  name: task-service-pod
+  namespace: task-manager
+  labels:
+    app: task-service
+  # ── Prometheus will discover this pod via these annotations ─────────────────
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port:   "9090"
+    prometheus.io/path:   "/metrics"
+spec:
+
+  containers:
+
+    # ── 1. PostgreSQL ──────────────────────────────────────────────────────────
+    - name: task-db
+      image: postgres:16-alpine
+      ports:
+        - containerPort: 5432
+      env:
+        - name: POSTGRES_USER
+          valueFrom:
+            secretKeyRef:
+              name: platform-secrets
+              key: POSTGRES_USER
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: platform-secrets
+              key: POSTGRES_PASSWORD
+        - name: POSTGRES_DB
+          value: "taskdb"
+        - name: PGDATA
+          value: /var/lib/postgresql/data/pgdata
+      volumeMounts:
+        - name: task-db-storage
+          mountPath: /var/lib/postgresql/data
+      resources:
+        requests:
+          memory: "128Mi"
+          cpu: "100m"
+        limits:
+          memory: "256Mi"
+          cpu: "250m"
+
+    # ── 2. Redis ───────────────────────────────────────────────────────────────
+    - name: task-redis
+      image: redis:7-alpine
+      command:
+        - redis-server
+        - "--appendonly"
+        - "yes"
+        - "--maxmemory"
+        - "128mb"
+        - "--maxmemory-policy"
+        - "allkeys-lru"
+      ports:
+        - containerPort: 6379
+      volumeMounts:
+        - name: task-redis-storage
+          mountPath: /data
+      resources:
+        requests:
+          memory: "64Mi"
+          cpu: "50m"
+        limits:
+          memory: "128Mi"
+          cpu: "100m"
+
+    # ── 3. FastAPI (task-service) ──────────────────────────────────────────────
+    - name: task-service
+      image: task-service:latest
+      imagePullPolicy: Never
+      ports:
+        - containerPort: 8000
+      env:
+        - name: DATABASE_URL
+          value: "postgresql://myuser:mypassword@localhost:5432/taskdb"
+        - name: REDIS_URL
+          value: "redis://localhost:6379/0"
+        - name: RABBITMQ_URL
+          value: "amqp://guest:guest@rabbitmq-svc:5672/"
+      readinessProbe:
+        httpGet:
+          path: /health
+          port: 8000
+        initialDelaySeconds: 15
+        periodSeconds: 5
+        failureThreshold: 5
+      livenessProbe:
+        httpGet:
+          path: /health
+          port: 8000
+        initialDelaySeconds: 30
+        periodSeconds: 10
+      resources:
+        requests:
+          memory: "128Mi"
+          cpu: "100m"
+        limits:
+          memory: "256Mi"
+          cpu: "300m"
+
+    # ── 4. Task Consumer (RabbitMQ worker) ─────────────────────────────────────
+    - name: task-consumer
+      image: task-consumer:latest
+      imagePullPolicy: Never
+      env:
+        - name: DATABASE_URL
+          value: "postgresql://user:password@localhost:5432/taskdb"
+        - name: REDIS_URL
+          value: "redis://localhost:6379/0"
+        - name: RABBITMQ_URL
+          value: "amqp://guest:guest@rabbitmq-svc:5672/"
+      resources:
+        requests:
+          memory: "64Mi"
+          cpu: "50m"
+        limits:
+          memory: "128Mi"
+          cpu: "150m"
+
+    # ── 5. Prometheus ──────────────────────────────────────────────────────────
+    # Runs inside the pod — scrapes metrics from:
+    #   - task-service FastAPI  → localhost:8000/metrics
+    #   - PostgreSQL exporter   → localhost:9187/metrics  (via postgres-exporter)
+    #   - Redis exporter        → localhost:9121/metrics  (via redis-exporter)
+    - name: prometheus
+      image: prom/prometheus:v2.51.0
+      ports:
+        - containerPort: 9090
+          name: prometheus
+      args:
+        - "--config.file=/etc/prometheus/prometheus.yml"
+        - "--storage.tsdb.path=/prometheus"
+        - "--storage.tsdb.retention.time=7d"   # keep 7 days of metrics
+        - "--web.enable-lifecycle"              # allow hot-reload of config
+      volumeMounts:
+        - name: prometheus-config
+          mountPath: /etc/prometheus
+        - name: prometheus-storage
+          mountPath: /prometheus
+      readinessProbe:
+        httpGet:
+          path: /-/ready
+          port: 9090
+        initialDelaySeconds: 10
+        periodSeconds: 5
+      livenessProbe:
+        httpGet:
+          path: /-/healthy
+          port: 9090
+        initialDelaySeconds: 15
+        periodSeconds: 10
+      resources:
+        requests:
+          memory: "128Mi"
+          cpu: "100m"
+        limits:
+          memory: "512Mi"
+          cpu: "500m"
+
+    # ── 5a. PostgreSQL Exporter ────────────────────────────────────────────────
+    # Converts PostgreSQL internal stats into Prometheus metrics
+    # Prometheus scrapes this at localhost:9187/metrics
+    - name: postgres-exporter
+      image: prometheuscommunity/postgres-exporter:v0.15.0
+      ports:
+        - containerPort: 9187
+      env:
+        - name: DATA_SOURCE_NAME
+          value: "postgresql://myuser:mypassword@localhost:5432/taskdb?sslmode=disable"
+      resources:
+        requests:
+          memory: "32Mi"
+          cpu: "25m"
+        limits:
+          memory: "64Mi"
+          cpu: "100m"
+
+    # ── 5b. Redis Exporter ─────────────────────────────────────────────────────
+    # Converts Redis internal stats into Prometheus metrics
+    # Prometheus scrapes this at localhost:9121/metrics
+    - name: redis-exporter
+      image: oliver006/redis_exporter:v1.58.0
+      ports:
+        - containerPort: 9121
+      env:
+        - name: REDIS_ADDR
+          value: "redis://localhost:6379"
+      resources:
+        requests:
+          memory: "32Mi"
+          cpu: "25m"
+        limits:
+          memory: "64Mi"
+          cpu: "100m"
+
+  # ── Volumes ──────────────────────────────────────────────────────────────────
+  volumes:
+    - name: task-db-storage
+      persistentVolumeClaim:
+        claimName: task-db-pvc
+    - name: task-redis-storage
+      persistentVolumeClaim:
+        claimName: task-redis-pvc
+    - name: prometheus-storage
+      persistentVolumeClaim:
+        claimName: prometheus-pvc
+    - name: prometheus-config
+      configMap:
+        name: prometheus-config   # defined below
+
+  restartPolicy: Always
+
+---
+# =============================================================================
+#  PROMETHEUS CONFIG
+#  Tells Prometheus WHAT to scrape and HOW OFTEN
+#  All targets are localhost because everything is in the same pod
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: task-manager
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s        # scrape every 15 seconds
+      evaluation_interval: 15s
+
+    scrape_configs:
+
+      # ── FastAPI app metrics ────────────────────────────────────────────────
+      # Requires: pip install prometheus-fastapi-instrumentator
+      # Add to main.py:
+      #   from prometheus_fastapi_instrumentator import Instrumentator
+      #   Instrumentator().instrument(app).expose(app)
+      - job_name: "task-service-api"
+        static_configs:
+          - targets: ["localhost:8000"]
+        metrics_path: /metrics
+
+      # ── PostgreSQL metrics ─────────────────────────────────────────────────
+      - job_name: "task-service-postgres"
+        static_configs:
+          - targets: ["localhost:9187"]
+        metrics_path: /metrics
+
+      # ── Redis metrics ──────────────────────────────────────────────────────
+      - job_name: "task-service-redis"
+        static_configs:
+          - targets: ["localhost:9121"]
+        metrics_path: /metrics
+
+      # ── Prometheus itself ──────────────────────────────────────────────────
+      - job_name: "prometheus"
+        static_configs:
+          - targets: ["localhost:9090"]
+
+---
+# =============================================================================
+#  PERSISTENT VOLUME CLAIMS
+# =============================================================================
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: task-db-pvc
+  namespace: task-manager
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: task-redis-pvc
+  namespace: task-manager
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 512Mi
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: prometheus-pvc
+  namespace: task-manager
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 2Gi     # stores 7 days of metrics
+
+---
+# =============================================================================
+#  SERVICES
+# =============================================================================
+
+# ClusterIP — internal access from other pods
+apiVersion: v1
+kind: Service
+metadata:
+  name: task-service-svc
+  namespace: task-manager
+spec:
+  selector:
+    app: task-service
+  ports:
+    - name: api
+      port: 8000
+      targetPort: 8000
+    - name: prometheus
+      port: 9090
+      targetPort: 9090
+  type: ClusterIP
+
+---
+# NodePort — access from your browser
+# http://localhost:30800/docs      → FastAPI
+# http://localhost:30900           → Prometheus UI
+apiVersion: v1
+kind: Service
+metadata:
+  name: task-service-nodeport
+  namespace: task-manager
+spec:
+  selector:
+    app: task-service
+  ports:
+    - name: api
+      port: 8000
+      targetPort: 8000
+      nodePort: 30800
+    - name: prometheus
+      port: 9090
+      targetPort: 9090
+      nodePort: 30900
+  type: NodePort
